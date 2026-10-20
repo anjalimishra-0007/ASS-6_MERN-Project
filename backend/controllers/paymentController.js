@@ -2,57 +2,45 @@ import Payment from '../models/Payment.js';
 import FeeStructure from '../models/FeeStructure.js';
 import User from '../models/User.js';
 
-// Helper to generate next unique receipt number
+// Helper to generate a unique receipt number like RCP-2026-0001
 export const generateReceiptNumber = async () => {
   const currentYear = new Date().getFullYear();
-  const prefix = `RCP-${currentYear}-`;
+  const count = await Payment.countDocuments();
+  const nextSeq = String(count + 1).padStart(4, '0');
+  let receiptNo = `RCP-${currentYear}-${nextSeq}`;
 
-  // Find the latest receipt of this year
-  const latestPayment = await Payment.findOne({
-    receiptNo: { $regex: `^${prefix}` }
-  })
-    .sort({ createdAt: -1 })
-    .select('receiptNo');
-
-  let nextSequence = 1;
-  if (latestPayment && latestPayment.receiptNo) {
-    const parts = latestPayment.receiptNo.split('-');
-    if (parts.length === 3) {
-      const parsedSeq = parseInt(parts[2], 10);
-      if (!isNaN(parsedSeq)) {
-        nextSequence = parsedSeq + 1;
-      }
-    }
-  }
-
-  // Double check uniqueness loop
-  let receiptNo = `${prefix}${String(nextSequence).padStart(4, '0')}`;
-  let exists = await Payment.findOne({ receiptNo });
-  while (exists) {
-    nextSequence++;
-    receiptNo = `${prefix}${String(nextSequence).padStart(4, '0')}`;
-    exists = await Payment.findOne({ receiptNo });
+  // Ensure uniqueness in case of any duplicate sequence
+  let existing = await Payment.findOne({ receiptNo });
+  let counter = count + 1;
+  while (existing) {
+    counter++;
+    receiptNo = `RCP-${currentYear}-${String(counter).padStart(4, '0')}`;
+    existing = await Payment.findOne({ receiptNo });
   }
 
   return receiptNo;
 };
 
-// Helper to compute fee dues, late fees, and status
+// Helper function to calculate student fees, late fees, and current status
 export const computeFeeStatus = async (studentId, feeStructureId, paymentDate = new Date()) => {
   const feeStructure = await FeeStructure.findById(feeStructureId);
   if (!feeStructure) {
     throw new Error('Fee structure not found');
   }
 
-  // All payments made by this student for this fee structure
+  // 1. Find all payments made by this student for this fee structure
   const payments = await Payment.find({
     student: studentId,
     feeStructure: feeStructureId
   }).sort({ paymentDate: 1 });
 
-  const totalPaid = payments.reduce((acc, curr) => acc + curr.amountPaid, 0);
+  // 2. Sum up total amount already paid
+  let totalPaid = 0;
+  for (let i = 0; i < payments.length; i++) {
+    totalPaid += payments[i].amountPaid;
+  }
 
-  // Late fee calculation: if payment date is after due date and pending amount > 0
+  // 3. Calculate late fee if payment is after due date
   let lateFee = 0;
   const payDateObj = new Date(paymentDate);
   const dueDateObj = new Date(feeStructure.dueDate);
@@ -63,9 +51,11 @@ export const computeFeeStatus = async (studentId, feeStructureId, paymentDate = 
     lateFee = Math.max(0, overdueDays * (feeStructure.lateFeePerDay || 0));
   }
 
+  // 4. Calculate total payable and remaining balance
   const totalPayable = feeStructure.totalAmount + lateFee;
   const pendingAmount = Math.max(0, totalPayable - totalPaid);
 
+  // 5. Status Workflow: Unpaid -> Partially Paid -> Paid
   let status = 'Unpaid';
   if (totalPaid >= totalPayable && totalPayable > 0) {
     status = 'Paid';
@@ -85,9 +75,8 @@ export const computeFeeStatus = async (studentId, feeStructureId, paymentDate = 
   };
 };
 
-// @desc    Record a new payment
+// @desc    Record a new payment (Admin only)
 // @route   POST /api/payments
-// @access  Private/Admin
 export const recordPayment = async (req, res, next) => {
   try {
     const {
@@ -102,11 +91,11 @@ export const recordPayment = async (req, res, next) => {
 
     const amountPaid = Number(amount);
 
-    // Business Rule 1: Reject zero or negative payments
+    // Business Rule 1: Reject zero or negative payment
     if (!amountPaid || amountPaid <= 0) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid payment amount. Amount must be greater than zero.'
+        message: 'Payment amount must be greater than zero.'
       });
     }
 
@@ -121,13 +110,13 @@ export const recordPayment = async (req, res, next) => {
     if (!student || student.role !== 'student') {
       return res.status(404).json({
         success: false,
-        message: 'Valid student account not found'
+        message: 'Student account not found.'
       });
     }
 
     const dateToUse = paymentDate ? new Date(paymentDate) : new Date();
 
-    // Compute existing status
+    // Check existing standing for this fee structure
     const summary = await computeFeeStatus(studentId, feeStructureId, dateToUse);
 
     // Business Rule 2: Cannot pay if already completely settled
@@ -138,17 +127,18 @@ export const recordPayment = async (req, res, next) => {
       });
     }
 
-    // Business Rule 3: Reject payments exceeding pending amount
+    // Business Rule 3: Reject payment if it exceeds pending balance (prevent overpayment)
     if (amountPaid > summary.pendingAmount) {
       return res.status(400).json({
         success: false,
-        message: `Payment amount (₹${amountPaid.toLocaleString('en-IN')}) exceeds the remaining pending balance of ₹${summary.pendingAmount.toLocaleString('en-IN')}.`
+        message: `Payment amount (₹${amountPaid}) cannot exceed the pending balance of ₹${summary.pendingAmount}.`
       });
     }
 
     // Generate unique receipt number
     const receiptNo = await generateReceiptNumber();
 
+    // Save payment to database
     const payment = await Payment.create({
       receiptNo,
       student: student._id,
@@ -162,17 +152,18 @@ export const recordPayment = async (req, res, next) => {
       remarks: remarks || 'Fee payment received'
     });
 
+    // Populate references to send in response
     const populatedPayment = await Payment.findById(payment._id)
       .populate('student', 'name email rollNumber course semester phone')
       .populate('feeStructure', 'course academicYear semester totalAmount dueDate feeHeads')
       .populate('recordedBy', 'name email');
 
-    // Recalculate status after payment
+    // Recalculate status after this payment
     const updatedSummary = await computeFeeStatus(studentId, feeStructureId, dateToUse);
 
     res.status(201).json({
       success: true,
-      message: `Payment of ₹${amountPaid.toLocaleString('en-IN')} recorded successfully. Receipt generated: ${receiptNo}`,
+      message: `Payment of ₹${amountPaid} recorded successfully. Receipt generated: ${receiptNo}`,
       data: populatedPayment,
       summary: {
         totalPayable: updatedSummary.totalPayable,
@@ -186,9 +177,8 @@ export const recordPayment = async (req, res, next) => {
   }
 };
 
-// @desc    Get single payment by receipt number
+// @desc    Get single receipt by receipt number
 // @route   GET /api/payments/receipt/:receiptNo
-// @access  Private (Admin or the student themselves)
 export const getPaymentByReceiptNo = async (req, res, next) => {
   try {
     const { receiptNo } = req.params;
@@ -205,18 +195,15 @@ export const getPaymentByReceiptNo = async (req, res, next) => {
       });
     }
 
-    // Role check: if student, they can only view their own receipt
-    if (
-      req.user.role === 'student' &&
-      payment.student._id.toString() !== req.user._id.toString()
-    ) {
+    // If logged in user is a student, ensure they only access their own receipt
+    if (req.user.role === 'student' && payment.student._id.toString() !== req.user._id.toString()) {
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to view this receipt'
       });
     }
 
-    // Compute student's overall fee standing for that structure
+    // Get overall fee standing
     const summary = await computeFeeStatus(
       payment.student._id,
       payment.feeStructure._id,
@@ -238,12 +225,11 @@ export const getPaymentByReceiptNo = async (req, res, next) => {
   }
 };
 
-// @desc    Get all payments (with filters for admin or current student)
+// @desc    Get list of payments
 // @route   GET /api/payments
-// @access  Private
 export const getAllPayments = async (req, res, next) => {
   try {
-    const { studentId, paymentMode, search, course, startDate, endDate } = req.query;
+    const { studentId, paymentMode, search, course } = req.query;
     const filter = {};
 
     // If student, restrict to their own records only
@@ -257,47 +243,39 @@ export const getAllPayments = async (req, res, next) => {
       filter.paymentMode = paymentMode;
     }
 
-    if (startDate || endDate) {
-      filter.paymentDate = {};
-      if (startDate) filter.paymentDate.$gte = new Date(startDate);
-      if (endDate) filter.paymentDate.$lte = new Date(endDate);
-    }
-
     if (search) {
       filter.receiptNo = { $regex: search, $options: 'i' };
     }
 
-    let query = Payment.find(filter)
+    let payments = await Payment.find(filter)
       .populate('student', 'name email rollNumber course semester')
       .populate('feeStructure', 'course academicYear semester totalAmount dueDate')
       .populate('recordedBy', 'name')
-      .sort({ paymentDate: -1, createdAt: -1 });
+      .sort({ paymentDate: -1 });
 
-    const payments = await query;
-
-    // Filter by course if specified
-    const filteredPayments = course
-      ? payments.filter((p) => p.student?.course?.toLowerCase().includes(course.toLowerCase()))
-      : payments;
+    if (course) {
+      payments = payments.filter((p) =>
+        p.student?.course?.toLowerCase().includes(course.toLowerCase())
+      );
+    }
 
     res.status(200).json({
       success: true,
-      count: filteredPayments.length,
-      data: filteredPayments
+      count: payments.length,
+      data: payments
     });
   } catch (error) {
     next(error);
   }
 };
 
-// @desc    Get fee summary and status for a student
+// @desc    Get student fee breakdown and ledger
 // @route   GET /api/payments/student-summary/:studentId
-// @access  Private
 export const getStudentFeeBreakdown = async (req, res, next) => {
   try {
     const studentId = req.params.studentId || req.user._id;
 
-    // If student role, ensure they are requesting their own ID
+    // Student can only access their own data
     if (req.user.role === 'student' && studentId.toString() !== req.user._id.toString()) {
       return res.status(403).json({
         success: false,
@@ -313,32 +291,35 @@ export const getStudentFeeBreakdown = async (req, res, next) => {
       });
     }
 
-    // Find all fee structures applicable for this student's course & semester
+    // Find all fee structures for this student's course
     const feeStructures = await FeeStructure.find({
       course: student.course
-    }).sort({ semester: 1, academicYear: -1 });
+    }).sort({ semester: 1 });
 
-    // For each fee structure, compute paid, late fee, pending and status
-    const structuresWithStatus = await Promise.all(
-      feeStructures.map(async (fs) => {
-        const statusData = await computeFeeStatus(student._id, fs._id);
-        return {
-          feeStructure: fs,
-          totalBaseFee: statusData.totalBaseFee,
-          lateFee: statusData.lateFee,
-          totalPayable: statusData.totalPayable,
-          totalPaid: statusData.totalPaid,
-          pendingAmount: statusData.pendingAmount,
-          status: statusData.status,
-          payments: statusData.payments
-        };
-      })
-    );
+    const structuresWithStatus = [];
+    let overallTotalBilled = 0;
+    let overallTotalPaid = 0;
+    let overallTotalPending = 0;
 
-    // Aggregate totals across all fee structures
-    const overallTotalBilled = structuresWithStatus.reduce((acc, curr) => acc + curr.totalPayable, 0);
-    const overallTotalPaid = structuresWithStatus.reduce((acc, curr) => acc + curr.totalPaid, 0);
-    const overallTotalPending = structuresWithStatus.reduce((acc, curr) => acc + curr.pendingAmount, 0);
+    for (let i = 0; i < feeStructures.length; i++) {
+      const fs = feeStructures[i];
+      const statusData = await computeFeeStatus(student._id, fs._id);
+
+      overallTotalBilled += statusData.totalPayable;
+      overallTotalPaid += statusData.totalPaid;
+      overallTotalPending += statusData.pendingAmount;
+
+      structuresWithStatus.push({
+        feeStructure: fs,
+        totalBaseFee: statusData.totalBaseFee,
+        lateFee: statusData.lateFee,
+        totalPayable: statusData.totalPayable,
+        totalPaid: statusData.totalPaid,
+        pendingAmount: statusData.pendingAmount,
+        status: statusData.status,
+        payments: statusData.payments
+      });
+    }
 
     let overallStatus = 'Unpaid';
     if (overallTotalBilled > 0 && overallTotalPaid >= overallTotalBilled) {
